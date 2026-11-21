@@ -421,8 +421,32 @@ def _inspect_via_dpkg_deb(path: Path, expected_arch: str) -> DebInfo | None:
 
 
 def inspect_deb(path: Path, expected_arch: str) -> DebInfo:
-    """Validate *path* as an ``.deb`` for *expected_arch* and return metadata."""
+    """Validate *path* as an ``.deb`` for *expected_arch* and return metadata.
 
+    Both the control metadata and the data archive are verified.
+    """
+
+    info, (data_offset, data_size, data_member) = _read_deb_metadata(
+        path, expected_arch
+    )
+    _validate_payload(path, data_offset, data_size, data_member, _MAX_PAYLOAD_BYTES)
+    return info
+
+
+def read_deb_control(path: Path, expected_arch: str) -> DebInfo:
+    """Return control metadata without streaming the whole data archive.
+
+    Used when the package already passed :func:`inspect_deb` at publication
+    time and only its control fields (e.g. ``Source``) are needed again.
+    """
+
+    info, _payload = _read_deb_metadata(path, expected_arch)
+    return info
+
+
+def _read_deb_metadata(
+    path: Path, expected_arch: str
+) -> tuple[DebInfo, tuple[int, int, str]]:
     try:
         size = path.stat().st_size
     except OSError as exc:
@@ -469,9 +493,7 @@ def inspect_deb(path: Path, expected_arch: str) -> DebInfo:
             info = fallback
         else:
             raise
-
-    _validate_payload(path, data_offset, data_size, data_member, _MAX_PAYLOAD_BYTES)
-    return info
+    return info, (data_offset, data_size, data_member)
 
 
 def _inspect_control(raw_control: bytes, control_member: str, expected_arch: str) -> DebInfo:

@@ -2,16 +2,18 @@
 
 Routes
 ------
-``GET  /docs``                      interactive upload form
+``GET  /docs``                      interactive upload forms
 ``POST /api/publish``               upload a batch of ``.deb`` files and publish
+``POST /api/sources``               bind an unsigned ``.dsc`` + source files to a .deb hash
+``GET  /api/sources/{sha256}``      download the source archive of a binding
 ``GET  /api/status``                repository state and publication history
 ``GET  /dists/...``, ``GET /pool/...``  the APT document tree (read-only)
 ``GET  /``                          plain-text instructions / sources.list
 ``GET  /swagger-ui``                generated OpenAPI documentation
 
 Every upload is written to a private intake directory, validated and hashed,
-and only then committed under a lock.  See :mod:`app.storage` for the
-transaction and recovery protocol.
+and only then committed under a lock.  See :mod:`app.storage` and
+:mod:`app.sourcestore` for the transaction and recovery protocols.
 """
 
 from __future__ import annotations
@@ -22,10 +24,17 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from email.utils import formatdate
 from pathlib import Path
+from typing import Annotated
 
 import anyio
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import (
+    FastAPI,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import (
     HTMLResponse,
@@ -38,6 +47,8 @@ from fastapi.responses import (
 from starlette.background import BackgroundTask
 
 from .config import Settings
+from .dsc import DscError, is_digest, safe_basename
+from .sourcestore import BindingConflict, SourceStore
 from .storage import PublicationError, Repository, StagedUpload
 
 #: Content types Debian clients expect for the repository documents.
@@ -56,9 +67,10 @@ UPLOAD_FORM = """<!doctype html>
  body {{ font: 15px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 52rem; }}
  code, pre {{ background: #f4f4f4; padding: .1rem .3rem; border-radius: 3px; }}
  pre {{ padding: .8rem; overflow-x: auto; }}
- form {{ border: 1px solid #ccc; padding: 1rem; border-radius: 6px; }}
+ form {{ border: 1px solid #ccc; padding: 1rem; border-radius: 6px; margin-bottom: 2rem; }}
  button {{ margin-top: .6rem; padding: .4rem 1rem; }}
  .hint {{ color: #555; }}
+ h2 {{ margin-top: 2rem; }}
 </style></head><body>
 <h1>APT repository upload</h1>
 <p>Suite <code>{suite}</code>, component <code>{component}</code>,
@@ -71,6 +83,24 @@ indexes are on disk; the two most recent publications stay downloadable.</p>
   <input type="file" name="files" multiple accept=".deb" required></label><br>
   <button type="submit">Publish</button>
 </form>
+
+<h2>Bind source to a binary package</h2>
+<p class="hint">Given the SHA-256 of a still-published <code>.deb</code>,
+ upload its builder-registered unsigned <code>.dsc</code> and every source file
+ listed in <code>Checksums-Sha256</code>. The same digest re-uploaded with the
+ same originals returns the existing archive; different originals are rejected
+ with <code>409 Conflict</code>.</p>
+<form method="post" action="/api/sources" enctype="multipart/form-data">
+  <label>Binary .deb SHA-256<br>
+  <input type="text" name="digest" size="68" pattern="[0-9a-f]{{64}}" required
+         placeholder="64 hex characters"></label><br><br>
+  <label>Unsigned .dsc<br>
+  <input type="file" name="dsc" accept=".dsc" required></label><br><br>
+  <label>Source files listed by Checksums-Sha256<br>
+  <input type="file" name="files" multiple required></label><br>
+  <button type="submit">Bind sources</button>
+</form>
+
 <h2>Client configuration</h2>
 <pre>echo 'deb [trusted=yes arch={architecture}] {base_url} {suite} {component}' \\
   | sudo tee /etc/apt/sources.list.d/internal.list
@@ -101,20 +131,23 @@ async def _stream(lease) -> AsyncIterator[bytes]:  # type: ignore[no-untyped-def
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
     repository = Repository(settings)
+    source_store = SourceStore(settings, repository)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Recover from an interrupted publication before serving anything.
+        # Recover from an interrupted publication/source write before serving.
         repository.reconcile()
+        source_store.reconcile()
         yield
 
     app = FastAPI(
         title="Internal APT repository",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "Single-suite, single-component APT repository with atomic "
-            "publications and Acquire-By-Hash retention of the last two "
-            "successful releases."
+            "publications, Acquire-By-Hash retention of the last two "
+            "successful releases and durable source-package bindings "
+            "addressed by the binary package SHA-256."
         ),
         lifespan=lifespan,
         # /docs is the upload form; the generated OpenAPI UI lives at /swagger.
@@ -124,6 +157,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.repository = repository
+    app.state.source_store = source_store
+
+    @app.exception_handler(DscError)
+    async def dsc_error_handler(request: Request, exc: DscError) -> JSONResponse:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.exception_handler(BindingConflict)
+    async def binding_conflict_handler(
+        request: Request, exc: BindingConflict
+    ) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.get("/", response_class=PlainTextResponse)
     def root() -> str:
@@ -137,6 +181,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             f"  {settings.sources_line}\n\n"
             "Then run: apt-get update && apt-get download <package>\n\n"
             "Upload packages at /docs or POST them to /api/publish.\n"
+            "Bind builder sources to a .deb hash at /docs or POST to /api/sources;\n"
+            "download the archive again at /api/sources/<sha256>.\n"
         )
 
     @app.get("/docs", response_class=HTMLResponse, include_in_schema=False)
@@ -227,13 +273,138 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/status")
     def status() -> JSONResponse:
-        return JSONResponse(repository.status())
+        body = repository.status()
+        body["source_bindings"] = len(source_store.list_bindings(10000))
+        return JSONResponse(body)
 
     @app.get("/api/publications")
     def publications() -> JSONResponse:
         return JSONResponse(
             {"publications": [p.to_dict() for p in repository.list_publications(50)]}
         )
+
+    # ----------------------------------------------------------- source bindings
+    @app.post("/api/sources", response_model=None)
+    def bind_sources(
+        digest: Annotated[str, Form()],
+        dsc: UploadFile,
+        files: list[UploadFile],
+    ) -> Response:
+        digest = (digest or "").strip().lower()
+        if not is_digest(digest):
+            raise HTTPException(
+                status_code=400,
+                detail="digest must be the 64 hex characters of a SHA-256",
+            )
+        if not dsc or not dsc.filename:
+            raise HTTPException(status_code=400, detail="an unsigned .dsc is required")
+        dsc_name = safe_basename(dsc.filename)
+        if not dsc_name.endswith(".dsc"):
+            raise HTTPException(
+                status_code=400, detail=f"{dsc_name}: only .dsc files are accepted"
+            )
+        if not files:
+            raise HTTPException(
+                status_code=400,
+                detail="at least one source file listed by Checksums-Sha256 is required",
+            )
+
+        token = uuid.uuid4().hex
+        intake = repository.incoming / f"src-{token}"
+        intake.mkdir(parents=True, exist_ok=False)
+        try:
+            dsc_bytes = b""
+            with (intake / "0000.dsc").open("wb") as out:
+                while chunk := dsc.file.read(1024 * 1024):
+                    dsc_bytes += chunk
+                    if len(dsc_bytes) > settings.max_file_bytes:
+                        raise HTTPException(
+                            status_code=413, detail=f"{dsc_name}: .dsc exceeds the size limit"
+                        )
+                    out.write(chunk)
+            if not dsc_bytes:
+                raise HTTPException(status_code=400, detail=f"{dsc_name}: uploaded file is empty")
+
+            source_files: dict[str, bytes] = {}
+            total = 0
+            for index, upload in enumerate(files):
+                name = safe_basename(upload.filename or f"source-{index}")
+                if name in source_files or name == dsc_name:
+                    raise HTTPException(
+                        status_code=400, detail=f"duplicate upload file name: {name}"
+                    )
+                data = b""
+                target = intake / f"{index:04d}.src"
+                with target.open("wb") as out:
+                    while chunk := upload.file.read(1024 * 1024):
+                        data += chunk
+                        total += len(chunk)
+                        if len(data) > settings.max_file_bytes:
+                            raise HTTPException(
+                                status_code=413, detail=f"{name}: file exceeds the size limit"
+                            )
+                        if total > settings.max_batch_bytes:
+                            raise HTTPException(
+                                status_code=413, detail="uploaded batch exceeds the size limit"
+                            )
+                        out.write(chunk)
+                if not data:
+                    raise HTTPException(
+                        status_code=400, detail=f"{name}: uploaded file is empty"
+                    )
+                source_files[name] = data
+
+            try:
+                binding = source_store.bind(digest, dsc_name, dsc_bytes, source_files)
+            except BindingConflict as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except DscError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500, detail=f"could not write the source archive: {exc}"
+                ) from exc
+        finally:
+            shutil.rmtree(intake, ignore_errors=True)
+
+        return JSONResponse(status_code=201, content={"binding": binding.to_dict()})
+
+    @app.get("/api/sources")
+    def list_sources() -> JSONResponse:
+        return JSONResponse(
+            {"bindings": [binding.to_dict() for binding in source_store.list_bindings()]}
+        )
+
+    @app.get("/api/sources/{digest}")
+    def download_source(digest: str) -> Response:
+        digest = (digest or "").strip().lower()
+        if not is_digest(digest):
+            raise HTTPException(status_code=400, detail="invalid SHA-256 digest")
+        lease = source_store.open_archive(digest)
+        if lease is None:
+            raise HTTPException(status_code=404, detail="no source binding for this digest")
+        filename = f"{digest}.tar"
+        headers = _lease_headers(lease)
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return StreamingResponse(
+            _stream(lease),
+            media_type="application/x-tar",
+            headers=headers,
+            background=BackgroundTask(lease.close),
+        )
+
+    @app.head("/api/sources/{digest}", include_in_schema=False)
+    def download_source_head(digest: str) -> Response:
+        digest = (digest or "").strip().lower()
+        if not is_digest(digest):
+            raise HTTPException(status_code=400, detail="invalid SHA-256 digest")
+        lease = source_store.open_archive(digest)
+        if lease is None:
+            raise HTTPException(status_code=404, detail="no source binding for this digest")
+        headers = _lease_headers(lease)
+        headers["Content-Disposition"] = f'attachment; filename="{digest}.tar"'
+        lease.close()
+        return Response(status_code=200, media_type="application/x-tar", headers=headers)
 
     def _lease_headers(lease) -> dict[str, str]:  # type: ignore[no-untyped-def]
         return {

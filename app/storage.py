@@ -280,6 +280,35 @@ class Repository:
             ).fetchone()
         return self._row_to_publication(row) if row else None
 
+    def find_retained_package(self, digest: str) -> dict[str, object] | None:
+        """Locate a package by binary SHA-256 inside the retained publications.
+
+        Only the newest ``retention`` committed publications count: once a
+        package is garbage-collected it no longer has a retained publication
+        reference and cannot be bound to sources.  The on-disk pool file must
+        still exist (its lease is what keeps a download alive during eviction).
+        """
+
+        if not digest:
+            return None
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT packages_json FROM publications WHERE state='committed' "
+                "ORDER BY id DESC LIMIT ?",
+                (self.settings.retention,),
+            ).fetchall()
+        for row in rows:
+            for entry in json.loads(row["packages_json"]):
+                if entry.get("sha256") == digest:
+                    pool_path = self.export / entry["filename"]
+                    if not pool_path.is_file():
+                        return None
+                    return {
+                        "entry": entry,
+                        "path": pool_path,
+                    }
+        return None
+
     # ------------------------------------------------------------- publishing
     def publish(self, uploads: list[StagedUpload]) -> Publication:
         if not uploads:
